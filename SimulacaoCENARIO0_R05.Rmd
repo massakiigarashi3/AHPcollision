@@ -1,0 +1,952 @@
+---
+title: "Model Validation for Scenario 00 - Release 05"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+  pdf_document:
+    fig_caption: yes
+    keep_tex: yes
+---
+### REFERENCES ----------------------------------------------------------------------------------
+CHOI, Chulho; KANG, Yeonsik. Simultaneous braking and steering control method based on nonlinear model predictive control for emergency driving support. International Journal of Control, Automation and Systems, v. 15, n. 1, p. 245-252, 2017.
+
+MAHMUD, SM Sohel et al. Application of proximal surrogate indicators for safety evaluation: A review of recent developments and research needs. IATSS research, v. 41, n. 4, p. 152-162, 2017.
+
+SCURLOCK, Bob J.; IPSER, James R. Illustrations of equivalent methods to reproduce vehicle and occupant dynamics as a pedagogical tool. arXiv preprint arXiv:1404.1542, 2014.
+
+XIE, Kun et al. Use of real-world connected vehicle data in identifying high-risk locations based on a new surrogate safety measure. Accident Analysis & Prevention, v. 125, p. 211-219, 2019.
+
+YANG, Hong. Simulation-based evaluation of traffic safety performance using surrogate safety measures. 2012. Thesis. Rutgers University-Graduate School-New Brunswick.
+
+```{r}
+library(tidyverse)
+library(caret)
+library(nlme)
+library(ISLR)
+library(glm2)
+library(ISLR)
+library(glm2)
+library(ggplot2)
+library(plotly)
+require(plotly)
+require(tidyverse)
+require(caret)
+require(nlme)
+require(ISLR)
+require(glm2)
+require(ISLR)
+require(glm2)
+require(ggplot2)
+```
+### FUNCTIONS DECLARATION
+```{r}
+# 0.1)Safe Stopping Distance FUNCTION
+# A função SSD(Safe Stopping Distance) serve para calcular a distância segura de parada para a velocidade selecionada do veículo em questão (Automóvel ou Caminhão). O resultado que ela retorno está no Sistema Intenacional; ou seja, metros.
+SSD <- function(velocity, vehicle)
+{
+  alphaA <-  85.372284
+  betaA  <-   0.007908
+  thetaA <- -90.859372
+  alphaT <-  92.91
+  betaT  <- 0.008481
+  thetaT <- -100.9
+  if (vehicle=="A")
+  { DTa_calc <- alphaA*exp(betaA*velocity)+thetaA
+    return (DTa_calc)}
+  else
+  { DTt_calc <- alphaT*exp(betaT*velocity)+thetaT
+    return (DTt_calc)}
+}
+#SSD(150, "A") 
+#Teste da função: 
+#SSD(150, "A") = 188.7019
+################################ DELTA S #######################################
+#0.2) DISPLACEMENT
+#s = s0 + v0t + at^2/2
+DeltaS <- function(v0, a, t){
+  return(v0*t + a*(t^2)/2)
+}
+############ Ds (Critical Distance during deceleration) ########################
+Ds <- function(vf1, vl1, af1, al1, Tbc1=0.15, Thum1=1.2, Tbr1 =0.45,  D0_1=2)
+{ if(al1==0)
+    al1 <- 0.1
+  if(af1==0)
+    af1 <- 0.1
+  vrel <- vf1 - vl1
+  h1 <- vl1^2/(2*al1)
+  f1 <- vf1^2/(2*af1)
+  respDs <- h1 - f1 + vl1*(Tbc1 + Thum1) + vrel*Tbr1/2 + D0_1
+  #view(c(vf1, vl1, af1, al1, respDs))
+  return(respDs)
+}
+################################   DSS   ######################################
+# 1) Difference of Space distance and Stopping distance- DSS: REF 45 from Mahmud(2017).
+DSS <- function(Vf, Vl, dT, u, dist, g) {
+  # VF = Following Vehicle Speed
+  # VL = Leader Vehicle Speed
+  # dT = Reaction time (Mean Reaction time = 1.5s)
+  # u = Friction Coefficient (DRY = 0.7 and WET = =.4)
+  # dist = distance between Leading vehicle and Following vehicle [m]
+  # g = Gravity Acceleraiton (9.8)
+  DSSf <- (Vf^2)/(2*u*g)
+  DSSl <- dT*Vl^2 + (Vl^2)/(2*u*g)
+  return(DSSf - DSSl)
+}
+###############################################################################
+# 2)Distance between vehicles
+# A função dist permite Calcular a Distância (em metros) a partir das coords. geográficas Latitude e longitude p/ 2ptos
+dist <- function(lat1, lon1, lat2, lon2)
+{
+  #Conversão de latitude
+  clat1 <- lat1*110.574657
+  clat2 <- lat2*110.574657
+
+  #Conversão de longitude
+  clon1 <- lon1*111.319892
+  clon2 <- lon2*111.319892
+
+  #Cálculo de distância
+  plat <- clat2 - clat1
+  plon <- clon2 - clon1
+  
+  plat2 <- plat ^ 2
+  plon2 <- plon ^ 2
+  out <- sqrt(plon2 + plat2) 
+  return (out*1000) #Retorna saída em metros
+}
+################################### TTC #######################################
+# 3)Time To Collision - TTC:  (MAHMUD, 2017).
+
+# A função TTC irá calcular o tempo para colisão
+TTC <- function(dist, Lv, Vf, Vl) # dist = Distance between vehicles,       Lv = length of leading vehicle
+{                                 #   Vf = Following vehicle,                Vl = Leading vehicle
+    divisor <- Vf - Vl
+    if(divisor==0)
+    {divisor <-0.1}
+    calcTTC <- (dist - Lv)/(divisor)
+    return (calcTTC)
+}
+#Teste da função:
+#TTC(25, 5, 20, 10) =2
+################################### CIF #######################################
+# 4) Criticality Index Function - CIF (CIF = V^2/TTC)
+# ----------------------------------------------------
+#    C.Y. Chan, Defining safety performance measures of driver-assistance systems for intersection left-turn 
+#    conflicts, Intelligent Vehicles Symposium, 2006 IEEEIEEE, 2006.
+CIF <- function(V, TTCi){
+  return(V^2/TTCi)
+}
+################################### TTCD #########################################
+# 5) Time to collision with disturbance - TTCD: (XIE, 2019)
+
+# Time to collision with disturbance - TTCD
+TTCD <- function(i, V1, V2, L0, Lv, d){
+
+#Vl = v1 = Speed of the leading vehicle
+#Vf = v2 = Speed of the following vehicle (constant in the car following scenario)  
+#L0 = Initial relative distance between the leading and the following vehicle
+#Lv = length of leading vehicle
+# d = The deceleration rate of the leading vehicle
+    if(d <= 0)
+    {d <- 0.1}
+
+  verifica <- (2*V1*V2 - V1*V1)/(2*(L0-Lv))
+
+  if(d<=verifica){
+    difV <- V1-V2
+    difL <- L0 - Lv
+    raiz <- difV*difV + 2*abs(d)*difL
+    TTCDcalc = (difV + sqrt(raiz))/d
+    }
+  else {
+    difL <- L0 - Lv
+    if(V2==0){V2<-0.1}
+    numerador <- 2*d*difL + V1^2
+    TTCDcalc = numerador/(2*d*V2)
+    }
+  return(TTCDcalc)
+}
+#Teste da função:
+#View(TTCD(1, 1, 10, 5, 10))
+################################################################################
+# 5.1) iTTCD
+iTTCD <- function(TTCDvalue)
+{ #OBS: Como o TTCD quanto maior o valor menor o risco de colisão, deve-se inverter o algortmo para iTTCD
+  if(TTCDvalue >=100)
+    {resp <- 100}
+  else if(TTCDvalue>1 && TTCDvalue<100)
+    {resp <- TTCDvalue}
+  else if(TTCDvalue==0)
+    {resp <- 0.1}
+  else if(TTCDvalue<0 && TTCDvalue>-1)
+    {resp <- 1/TTCDvalue*(-1)}
+  else 
+    {resp <- TTCDvalue*(-1) }
+  return(resp)
+}
+################################### DRAC ######################################
+# 6) Deceleration Rate to Avoid Crash - DRAC: (MAHMUD, 2017).
+
+# Deceleration Rate to Avoid Crash (DRAC)
+DRAC <- function(Vf, Vl, dist, Lv)    # v1 = Initial speed of the leading vehicle [m/s]
+{                                     # v2 = Initial speed of the following vehicle (constant in the car following scenario)
+                                      # dist = Distance between vehicles [m]
+                                      # Lv = length of leading vehicle [m]
+  calcDRAC <- ((Vf-Vl)^2)/(2*(dist-Lv))
+  return (calcDRAC)
+}
+#Teste da função:
+# DRAC(2, 1, 10, 5)=0.1
+####################################
+# 7)iDRAC
+iDRAC <- function(DRACvalue)
+{
+  resp <- 1000*DRACvalue
+  if(resp>=100)
+    return (100)
+  else
+    return(resp)
+}
+#Teste da função:
+#for (i in 1:10) {
+#    print(iDRAC(i))
+#}
+################################### MTTC ######################################
+# 8) Modified Time to Collision - MTTC: Page 41 (YANG, 2012) ou (MAHMUD, 2017).
+MTTC <- function(deltaV, deltaA, D){
+  # deltaV = vR = Relative Speed
+  # deltaA = Relative Acceleration
+       # D = Initial Relative Space Gap
+  if(deltaA != 0)
+  {
+    raiz <- deltaV^2 + 2*deltaA*D
+    t1 <- deltaV*(-1) -sqrt(abs(raiz))
+    t2 <- deltaV*(-1) +sqrt(abs(raiz))
+    if(t1>0 && t2>0)
+    {
+      if(t1>=t2){
+        ProbMTTC.df1 <- data.frame(deltaV, deltaA, D, t1, t2)
+        #View(ProbMTTC.df1)
+        return(t2)}
+      else if(t1<t2){
+        ProbMTTC.df2 <- data.frame(deltaV, deltaA, D, t1, t2)
+        #View(ProbMTTC.df2)
+        return(t1)
+        }
+    }
+    else if(t1>0 && t2<=0)
+    { ProbMTTC.dF0 <- data.frame(deltaV, deltaA, D, t1, t2)
+      #View(ProbMTTC.dF0)
+      return(t1)  }
+    else if(t1<0 && t2>0)
+    {
+      ProbMTTC.dF4 <- data.frame(deltaV, deltaA, D, t1, t2)
+      #View(ProbMTTC.dF4)
+      return(t2)}
+  }
+  else if(deltaA==0 && deltaV>0)
+  {
+    if(D==0){D<-0.1}
+    ProbMTTC.df5 <- data.frame(deltaV, deltaA, D, t1, t2)
+    #View(ProbMTTC.df5)
+    return(D/deltaV)}
+  else
+  {
+    if(D==0){D<-0.1}
+    if(deltaV==0){deltaV<-0.1}
+    return(D/deltaV)}
+}
+###############################################################################
+# 8.1) iMTTC
+iMTTC <- function(MTTCvalue)
+{
+  if(MTTCvalue >=100)
+    {resp <- 100}
+  else if(MTTCvalue>0 && MTTCvalue<100)
+    {resp <- MTTCvalue}
+  else if(MTTCvalue==0)
+    {resp <- 0.1}
+  else if(MTTCvalue<0 && MTTCvalue>-1)
+    {resp <- MTTCvalue*(-1)}
+  else 
+    {resp <- 1/(MTTCvalue*(-1)) }
+  return(resp)
+}
+####################################### CI ####################################
+# 9) Crash Index: (MAHMUD, 2017)
+CI <- function(vf, af, MTTCi, vl, al){
+  # vf    = Folowing Vehicle Speed
+  # vl    = Leading Vehicle Speed
+  # af    = Following Vehicle Acceleraiton
+  # al    = Leading Vehicle Acceleraiton  
+  # MTTCi = Modified Time to Collision index
+  factor1 <- (vf + af*MTTCi)^2
+  factor2 <- (vl + al*MTTCi)^2
+  return((1/MTTCi)*(factor1-factor2)/2.0)
+}
+###############################################################################
+# 9.1) iCI
+iCI <- function(CIvalue)
+{
+  if(CIvalue >=100)
+    {resp <- 100}
+  else if(CIvalue>0 && CIvalue<100)
+    {resp <- CIvalue}
+  else if(CIvalue==0)
+    {resp <- 0.1}
+  else if(CIvalue<0 && CIvalue>-1)
+    {resp <- CIvalue*(-1)}
+  else 
+    {resp <- 1/(-CIvalue) }
+  return(resp)
+}
+###############################################################################
+# 10) CPi: Page 43 - (YANG, 2012)
+CPi <- function(MTTCvalue)
+{
+  lambda <- 1.4419*MTTCvalue - 0.0012
+  Fator <- (-1)*MTTCvalue/lambda
+  return(exp(Fator))
+}
+####################### Go to LINE 315 and CLICK To Execute ###################
+```
+# AHP FUNCTION MODEL - Release 5.0 (By Massaki de O. Igarashi)
+```{r}
+AHP <- function(PS11, PS12, PS13, PS14, PS15,
+                PS21, PS22, PS23, PS24, PS25,
+                PS31, PS32, PS33, PS34, PS35,
+                PS41, PS42, PS43, PS44, PS45,
+                PS51, PS52, PS53, PS54, PS55,
+                C11,  C16,  C21,  C26,  C31){
+  
+# c11 = iTTCD  input value
+# c16 = iDRAC  input value
+# c21 = iMTTC  input value
+# c26 = iCI    input value
+# c31 = IDdist input value
+  
+# Matriz AVN
+#            iTTCD    iDRAC    iMTTC      iCI     iDdist 
+# iTTCD      PS11     PS12      PS13      PS14    PS15
+# iDRAC      PS21     PS22      PS23      PS24    PS25
+# iMTTC      PS31     PS32      PS33      PS34    PS35
+# iCI        PS41     PS42      PS43      PS44    PS45
+# IdDIST     PS51     PS52      PS53      PS54    PS55
+#------------------------------------------------------
+#SOMATORIO   PST1     PST2      PST3      PST4    pst5
+  
+  PS <- matrix(c(
+              c(PS11, PS12, PS13, PS14, PS15),
+              c(PS21, PS22, PS23, PS24, PS25),
+              c(PS31, PS32, PS33, PS34, PS35),
+              c(PS41, PS42, PS43, PS44, PS45),              
+              c(PS51, PS52, PS53, PS54, PS55)), byrow=TRUE, nrow=5)
+  colnames(PS)<-c("TTCD", "DRAC", "MTTC", "CI", "Ddist") 
+  rownames(PS)<-c("TTCD", "DRAC", "MTTC", "CI", "Ddist") 
+  #View(PS)
+  PST <- colSums(PS, na.rm = FALSE, dims = 1)
+
+  AV1 <- sqrt(PS11*PS12*PS13*PS14*PS15)
+  AV2 <- sqrt(PS21*PS22*PS23*PS24*PS25)
+  AV3 <- sqrt(PS31*PS32*PS33*PS34*PS35)
+  AV4 <- sqrt(PS41*PS42*PS43*PS44*PS45)
+  AV5 <- sqrt(PS51*PS52*PS53*PS54*PS55)
+  AVT <- AV1 + AV2 + AV3 + AV4 + AV5
+  AVN1 <- AV1/AVT
+  AVN2 <- AV2/AVT
+  AVN3 <- AV3/AVT
+  AVN4 <- AV4/AVT
+  AVN5 <- AV5/AVT
+
+  LambdaMAX <- PST[1]*AVN1 + PST[2]*AVN2 + PST[3]*AVN3 + PST[4]*AVN4 + PST[5]*AVN5
+  n <- 5 #Pois tenho 5 critérios
+  CI <- (LambdaMAX - n)/(n-1)
+  CR <- CI/1.1086 #Ver pág. 25 do livro do Mateo Brunelli sobre AHP
+ 
+  # MATRIZ TTCD*
+  B11 <- 1
+  B12 <- 1/C11
+  B13 <- B11 + B12
+  #C11 IS INPUT VALUE
+  C12 <- 1
+  C13 <- C11 + C12
+  D11 <- sqrt(abs(B11*C11))
+  D12 <- sqrt(abs(B12*C12))
+  D13 <- D11 + D12
+  AVN_TTCD_1 <- D11/D13
+  AVN_TTCD_2 <- D12/D13
+  AVN_TTCD_T <- AVN_TTCD_1 + AVN_TTCD_2
+  
+  # MATRIZ DRAC*
+  B16 <- 1
+  B17 <- 1/C16
+  B18 <- B16 + B17
+  #C16 IS INPUT VALUE 
+  C17 <- 1
+  C18 <- C16 + C17
+  D16 <- sqrt(B16*C16)
+  D17 <- sqrt(B17*C17)
+  D18 <- D16 + D17
+  AVN_DRAC_1 <- D16/D18
+  AVN_DRAC_2 <- D17/D18
+  AVN_DRAC_T <- AVN_DRAC_1 + AVN_DRAC_2
+  
+  # MATRIZ MTTC
+  B21 <- 1
+  B22 <- 1.0/C21
+  B23 <- B21 + B22
+  #C21 IS INPUT VALUE
+  C22 <- 1
+  C23 <- C21 + C22
+  D21 <- sqrt(B21*C21)
+  D22 <- sqrt(B22*C22)
+  D23 <- D21 + D22
+  AVN_MTTC_1 <- D21/D23
+  AVN_MTTC_2 <- D22/D23
+  AVN_MTTC_T <- AVN_MTTC_1 + AVN_MTTC_2
+  
+  # MATRIZ CI
+  B26 <- 1
+  B27 <- 1/C26
+  B28 <- B26 + B27
+  #C26 IS INPUT VALUE
+  C27 <- 1
+  C28 <- C26 + C27
+  D26 <- sqrt(B26*C26)
+  D27 <- sqrt(B27*C27)
+  D28 <- D26 + D27
+  AVN_CI_1 <- D26/D28
+  AVN_CI_2 <- D27/D28
+  AVN_CI_T <- AVN_CI_1 + AVN_CI_2
+  
+  # MATRIZ Ddist
+  B31 <- 1
+  B32 <- 1/C31
+  B33 <- B31 + B32
+  #C31 IS INPUT VALUE
+  C32 <- 1
+  C33 <- C31 + C32
+  D31 <- sqrt(B31*C31)
+  D32 <- sqrt(B32*C32)
+  D33 <- D31 + D32
+  AVN_Ddist_1 <- D31/D33
+  AVN_Ddist_2 <- D32/D33
+  AVN_Ddist_T <- AVN_Ddist_1 + AVN_Ddist_2
+  
+  # OPÇÕES DE DECISÃO ###################################################################
+  DANGEROUS <- 100*(AVN1*AVN_TTCD_1 + AVN2*AVN_DRAC_1 + AVN3*AVN_MTTC_1 + AVN4*AVN_CI_1 + AVN5*AVN_Ddist_1)
+       SAFE <- 100*(AVN1*AVN_TTCD_2 + AVN2*AVN_DRAC_2 + AVN3*AVN_MTTC_2 + AVN4*AVN_CI_2 + AVN5*AVN_Ddist_2)
+  if(DANGEROUS>50){decisao <- "DANGEROUS"}
+  else {decisao <- "SAFE"}
+  outputAHP <- list(decisao, toString(DANGEROUS), toString(SAFE), toString(LambdaMAX), toString(CI), toString(CR*100))
+  return(outputAHP)
+} 
+
+####################### Go to LINE 450 and CLICK To Execute ###################
+```
+
+# INPUTS AND SIMULATIONS  ******************************************************
+```{r}
+# *****************************************************************************
+# 0.0) VEHICLES VELOCITIES (VL= LEADING VEHICLE, VF = FOLLOWING VEHICLE)
+# *****************************************************************************
+t <- seq(12)
+VL0 <-c(15, 20, 25, 30, 35, 40, 35, 30, 25, 20, 15, 10)*0.2778
+VF0 <-c( 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60)*0.2778
+
+VelL0.df <- data.frame(x = t, y = 0.2778*VL0) #Multiplica por 0.2778 para converter de km/h para m/s
+VelF0.df <- data.frame(x = t, y = 0.2778*VF0)
+Vel.df <- data.frame(x = VL0, y = VF0)
+
+DeltaV0 <- VF0 - VL0
+# plot VELOCITY data
+plot(t, VL0, ylim = c(1,20), type = "b", pch=5, col = "red",  main = "VEHICLES' VELOCITIES", xlab = "Time (s)", ylab = "Velocity [m/s])") 
+par(new = TRUE)
+lines(t, VF0, ylim = c(1,20), pch=18, type = "b", col = "blue",lty=2) 
+
+# Add a legend to the plot
+# Add a legend
+legend(9.5, 12, legend=c("Leading", "Following"),
+      col=c("red", "blue"), lty=1:2, cex=1)
+####################### Vá para a LINHA 475 e clique no Triângulo EXECUTAR ####
+```
+
+```{r}
+#library(plotly)
+#require(plotly)
+t <- seq(12)
+fig <- ggplot(data=Vel.df, aes(x=t)) + labs(title = "VEHICLES' VELOCITIES") + xlab("TIME [s]") + 
+  ylab("VELOCITY [m.s-1]") + xlim(1, 12) + ylim(0, 20) +
+  geom_line(aes(y = VL0), color = "darkred",   linetype=2, size = 3) + 
+  geom_line(aes(y = VF0), color = "black", linetype=6, size = 2) +  
+  
+  scale_color_manual(name="VEHICLES VELOCITY")+
+  guides(colour = guide_legend(override.aes = list(linetype = 1)))
+ggplotly(fig)
+####################### Go to LINE 490 and CLICK To Execute ###################
+```
+
+```{r}
+# ******************************************************************************
+# 0.1) Acceleration = DeltaV/DeltaT 
+# *****************************************************************************
+aL0 <- numeric(12)
+aF0 <- numeric(12)
+for(i in 1:11){
+    aL0[i] <- (VL0[i+1]-VL0[i])/(t[i+1]-t[i])
+    aF0[i] <- (VF0[i+1]-VF0[i])/(t[i+1]-t[i])
+}
+aL0[12] <- aL0[11]
+aF0[12] <- aF0[11]
+AccelL0.df <- data.frame(x = t, y = aL0)
+AccelF0.df <- data.frame(x = t, y = aF0)
+DeltaA0 <- aF0 - aL0
+
+# plot ACELERATION  data
+par(mfrow=c(2, 1))
+plot(t, AccelL0.df$y,  type = "b", pch=5, col = "red",  main = "Leader Vehicle Acceleration", xlab = "Time (s)", ylab = "Acceleration[m/s-2])")
+
+plot(t, AccelF0.df$y,  type = "b", pch=18, col = "blue",  main = "Following Vehicle Acceleration", xlab = "Time (s)", ylab = "Acceleration[m/s-2])")
+####################### Go to LINE 515 and CLICK To Execute ###################
+```
+
+
+```{r}
+# *****************************************************************************
+# 0.2) Displacement Vectors
+# *****************************************************************************
+## DeltaS <- function(v0, a, t){
+DeltaSvectorF0 <- numeric(12)
+DeltaSvectorL0 <- numeric(12)
+t <- seq(12)
+DeltaS0.df <- data.frame(x = VelF0.df$x, y = DeltaSvectorF0, z = DeltaSvectorL0)
+for(i in 1:11){
+  DeltaSvectorF0[i] <- DeltaS(VF0[1], aF0[i], VF0[i])
+  DeltaSvectorL0[i] <- DeltaS(VL0[1], aL0[i], VL0[i])
+}
+par(mfrow=c(2, 1))
+plot(t, DeltaSvectorL0,  type = "b", pch=5, col = "red",  main = "DeltaS Leading", xlab = "Time (s)", ylab = "DeltaS [m]") 
+
+plot(t, DeltaSvectorF0,  type = "b", pch=5, col = "blue",  main = "DeltaS Following", xlab = "Time (s)", ylab = "DeltaS [m]")
+####################### Go to LINE 535 and CLICK To Execute ###################
+```
+
+```{r}
+###############################################################################
+# 0.3) Ds (Critical Distance during deceleration) #############################
+# Ds <- function(vF0, vL0, aF0, aL0, Tbc1=0.15, Thum1=1.2, Tbr1 =0.45,  D0_1=2)
+CDDD <- numeric(12)
+for(i in 1:12) {
+  CDDD[i] <- Ds(VF0[i], VL0[i], aF0[i], aL0[i], 0.15, 1.2, 0.45,  2)
+}
+plot(t, CDDD, ylim = c(-1000, 1000), type = "b", pch=5, col = "red", main = "Critical Distance during deceleration", xlab = "Time (s)", ylab = "Critical Distance during deceleration")
+
+# *****************************************************************************
+# 0.4)  Cummulative Displacement calculus for this scenario
+# PARA ENCONTRAR A REAL POSIÇÃO DE CADA VEÍCULO
+# *****************************************************************************
+DeltaSLcumullate0 <- cumsum(DeltaSvectorL0)
+DeltaSFcumullate0 <- cumsum(DeltaSvectorF0)
+DeltaScumullate0.df <- data.frame(x = DeltaSLcumullate0, y = DeltaSFcumullate0)
+DeltaSLcumullate0.df <- data.frame(x = t, y = DeltaSLcumullate0)
+DeltaSFcumullate0.df <- data.frame(x = t, y = DeltaSFcumullate0)
+DeltaScummullate0.df <- data.frame(x = t, y = DeltaSFcumullate0, z = DeltaSLcumullate0)
+#Cumulative spatial displacement data PLOT
+#par(mfrow=c(2, 1))
+plot(t, DeltaSLcumullate0.df$y,  ylim = c(0, 1000), type = "b", pch=5, col = "red",  main = "Cumulative spatial displacement", xlab = "Time (s)", ylab = "Cumulative spatial displacement [m]")
+par(new = TRUE)
+lines(t, DeltaSFcumullate0.df$y, ylim = c(0, 1000), pch=18, type = "b", col = "blue",lty=2) 
+legend(2, 800, legend=c("Leader", "Following"), col=c("red", "blue"), lty=1:2, cex=1)
+####################### Go to LINE 565 and CLICK To Execute ###################
+
+```
+
+```{r}
+# *****************************************************************************
+# 0.5) Ddist = Distance between vehicles calculus for this Scenario
+# *****************************************************************************
+Ddist0 <- numeric(12)
+iDdist0 <- numeric(12)
+for(i in 1:12) {
+  Ddist0[i] <- DeltaSLcumullate0.df$y[i] - DeltaSFcumullate0.df$y[i]
+  if(Ddist0[i]<=100)
+    iDdist0[i] <- (-1)*Ddist0[i] + 100
+  else
+    iDdist0[i] <- 1.0/Ddist0[i] 
+  if(iDdist0[i]>= 100)
+    iDdist0[i] <- 100
+}
+plot(t, Ddist0, ylim = c(-600, 250), type = "b", pch=5, col = "black",  main = "Distance between vehicles[m]  x T[s]", xlab = "Time (s)", ylab = "Distance between vehicles[m]")
+par(new = TRUE)
+lines(t, iDdist0, pch=18, type = "b", col = "red",lty=2)
+legend(1, -100, legend=c("Ddist", "iDdist"), col=c("black", "red"), lty=1:2, cex=1)
+
+Ddist0.df <- data.frame(t, VL0,VF0, Ddist0)
+write.csv2(Ddist0.df, "C:\\WYOMING2\\DataFrames\\DistanceBetweenVehiclesCENARIO0_R04.csv")
+# *****************************************************************************
+# 0.6) Decelaration Rate calculus for this Scenario
+# *****************************************************************************
+decL0 <- numeric(12) #To create a vector with 12 numbers zero
+decF0 <- numeric(12) 
+for(i in 1:11) {
+  decL0[i] <- aL0[i+1]- aL0[i]
+  decF0[i] <- aF0[i+1]- aF0[i]
+}
+decL0[12] <- decL0[11]
+decF0[12] <- decF0[11]
+
+###############################################################################
+#Plot Deceleration Rate
+plot(t, decL0,  type = "b", ylim = c(-10, 10), pch=5, col = "red", main = "Deceleration Rate", xlab = "Time (s)", ylab = "Deceleration Rate")
+par(new = TRUE)
+lines(t, decF0,  pch=18, type = "b", col = "blue",lty=2) 
+legend(8, 7, legend=c("Leading", "Following"),
+       col=c("red", "blue"), lty=1:2, cex=1)
+
+# *****************************************************************************
+# 1) Difference of Space distance and Stopping distance- DSS [REF 45 do MAHMUD]
+# *****************************************************************************
+#DSS <- function(Vf, Vl, dT, u, dist, g) {
+# VF = Following Vehicle Speed
+# VL = Leader Vehicle Speed
+# dT = Reaction time (Mean Reaction time = 1.5s)
+# u = Friction Coefficient (DRY = 0.7 and WET = =.4)
+# dist = distance between Leading vehicle and Following vehicle [m]
+# g = Gravity Acceleraiton (9.8)
+
+DSSvector0 <- numeric(12)
+for(i in 1:12){
+  DSSvector0[i] <- DSS(VF0[i], VL0[i], 1.5, 0.7, Ddist2[i], 9.8)
+}
+plot(t, DSSvector0,  type = "b", pch=5, col = "orange",  main = "DSS  x T[s]", xlab = "Time (s)", ylab = "DSS [m]")
+
+# *****************************************************************************
+# 2) TTC calculus for this Scenario
+# A sigla TTC faz alusão à Time To Collision - TTC; irá calcular o tempo para colisão
+# *****************************************************************************
+#TTC <- function(dist, Lv, Vf, Vl) 
+# dist = Distance between vehicles,       
+# Lv = length of leading vehicle
+# Vf = Following vehicle, 
+# Vl = Leading vehicle
+
+TTCvector0 <- numeric(12)
+for(i in 1:12) {
+  TTCvector0[i] <- TTC(Ddist0[i],5,VelF0.df$y[i], VelL0.df$y[i])
+}
+# Plot TTC index 
+plot(t, TTCvector0,  type = "b", pch=5, col = "orange",  main = "TTC index  x T[s]", xlab = "Time (s)", ylab = "TTC index")
+
+# *****************************************************************************
+# 3) Time to collision with disturbance - TTCD calculus for this Scenario
+# *****************************************************************************
+#TTCD <- function(V1, V2, L0, Lv, d){
+#Vl = v1 = Speed of the leading vehicle [m/s]
+#Vf = v2 = Speed of the following vehicle (constant in the car following scenario)
+#L0 = Initial relative distance between the leading and the following vehicle
+#Lv = length of leading vehicle
+# d = The deceleration rate of the leading vehicle
+TTCDvector0 <- numeric(12)
+iTTCDvector0 <- numeric(12)
+for (i in 1:12) {
+  TTCDvector0[i] <- TTCD(tF0[i], VL0[i], VF0[i], Ddist0[1], 5, decL0[i])
+  iTTCDvector0[i] <- iTTCD(TTCDvector0[i])
+}
+
+plot(t, TTCDvector0,  type = "b", pch=5, col = "orange",  main = "TTCD index  x T[s]", xlab = "Time (s)", ylab = "TTCD index")
+
+plot(t, iTTCDvector0,  type = "b", pch=5, col = "pink",  main = "iTTCD index  x T[s]", xlab = "Time (s)", ylab = "iTTCD index")
+
+# *****************************************************************************
+# 4) Criticality Index Function - CIF (CIF = V^2/TTC)
+# *****************************************************************************
+# CIF <- function(V, TTCi)
+CIFvector0 <- numeric(12)
+for(i in 1:12){
+  CIFvector0[i] <- CIF(VelF0.df$y[i], TTCvector0[i])
+}
+plot(t, CIFvector0,  type = "p", pch=5, col = "blue",  main = "CIF index", xlab = "Time (s)", ylab = "CIF index")
+# *****************************************************************************
+# 5) MTTC calculus for this Scenario
+# *****************************************************************************
+# MTTC <- function(deltaV, deltaA, D)
+# deltaV = Relative Speed
+# deltaA = Relative Acceleration
+#      D = Initial Relative Space Gap
+
+MTTCvector0 <- numeric(12)
+iMTTCvector0 <- numeric(12)
+lambda0 <- numeric(12)
+Fator0 <- numeric(12)
+CPivector0 <- numeric(12)
+CPiNormaL0 <- numeric(12)
+t <- seq(12)
+for(i in 1:12){
+  MTTCvector0[i] <- MTTC(DeltaV0[i], DeltaA0[i], Ddist0[i])
+  iMTTCvector0[i] <- iMTTC(MTTCvector0[i])
+  
+  ################ CÁLCULO DO CPi A PARTIR DO MTTC: TESE DO (YANG, 2012) #######
+  lambda0[i] <- 1.4419*MTTCvector0[i] - 0.0012
+  Fator0[i] <- ((-1)*MTTCvector0[i])/lambda0[i]
+  CPivector0[i] <- 100*exp(Fator0[i])
+}
+CPiMAX <- max(CPivector0)
+
+for(j in 1:12){
+  CPiNormaL0[i] <- CPivector0[i]/CPiMAX
+}
+MTTC.df <- data.frame(DeltaV0, DeltaA0, Ddist0, lambda0, Fator0, MTTCvector0, iMTTCvector0, CPivector0)
+
+par(mfrow=c(2, 1))
+plot(t, MTTCvector0,  type = "o", pch=5, col = "blue",  main = "MTTC index", xlab = "Time (s)", ylab = "MTTC index")
+
+plot(t, iMTTCvector0,  type = "o", pch=5, col = "pink",  main = "iMTTC index", xlab = "Time (s)", ylab = "iMTTC index")
+
+plot(t, CPiNormaL0,  ylim = c(0,1), type = "o", pch=5, col = "pink",  main = "CPi index", xlab = "Time (s)", ylab = "CPi index")
+
+# *****************************************************************************
+# 6) Crash Index calculus for this Scenario
+# ******************************************************************************
+# CI <- function(vf, af, MTTCi, vl, al){
+# vf    = Folowing Vehicle Speed [m/s]
+# vl    = Leading Vehicle Speed
+# af    = Following Vehicle Acceleraiton
+# al    = Leading Vehicle Acceleraiton  
+# MTTCi = Modified Time to Collision index
+
+CIvector0 <- numeric(12) 
+iCIvector0 <- numeric(12) 
+for(i in 1:12) {
+  CIvector0[i] <- CI(VF0[i], AccelF0.df$y[i], MTTCvector0[i], VL0[i], AccelL0.df$y[i])
+  iCIvector0[i] <- iCI(CIvector0[i])
+}
+#Plot Deceleration Rate
+plot(t, CIvector0,  type = "b", pch=5, col = "blue",  main = "Crash Index", xlab = "Time (s)", ylab = "Crash Index")
+
+plot(t, iCIvector0,  type = "b", pch=5, col = "pink",  main = "iCrash Index", xlab = "Time (s)", ylab = "iCrash Index")
+
+# ******************************************************************************
+# 7) DRAC vector calculus for this Scenario
+# *****************************************************************************
+DRACvector0 <- numeric(12)
+for(i in 1:12) {
+  
+# Deceleration Rate to Avoid Crash (DRAC)
+#DRAC <- function(Vf, Vl, dist, Lv)    # v1 = Initial speed of the leading vehicle
+#{                                     # v2 = Initial speed of the following vehicle (constant in the car following scenario)
+                                      # dist = Distance between vehicles,
+                                      # Lv = length of leading vehicle
+  
+  DRACvector0[i] <- DRAC(VF0[i], VL0[i], abs(Ddist0[i]), 5)
+}
+#Plot DRAC index
+plot(t, DRACvector0,  type = "c", pch=5, col = "purple",  main = "DRAC index  x T[s]", xlab = "Time (s)", ylab = "DRAC index")
+
+###############################################################################
+#iDRAC
+iDRACvector0 <- numeric(12)
+for (i in 1:12) {
+   iDRACvector0[i] <- iDRAC(DRACvector0[i])
+}
+#Plot iDRAC index
+plot(t, iDRACvector0,  type = "c", pch=5, col = "purple",  main = "iDRAC index  x T[s]", xlab = "Time (s)", ylab = "iDRAC index")
+
+####################### Go to LINE 760 and CLICK To Execute ###################
+
+```
+
+# AHP FUNCTION MODEL USE
+```{r}
+#AHP <- function(PS11, PS12, PS13, PS14, PS15,
+#                PS21, PS22, PS23, PS24, PS25,
+#                PS31, PS32, PS33, PS34, PS35,
+#                PS41, PS42, PS43, PS44, PS45,
+#                PS51, PS52, PS53, PS54, PS55,
+#                C11,  C16,  C21,  C26,  C31){
+# c11 = iTTCD  input value
+# c16 = iDRAC  input value
+# c21 = iMTTC  input value
+# c26 = iCI    input value
+# c31 = IDdist input value
+hazard0 <- numeric(12)
+decision0 <- numeric(12)
+t <- seq(12)
+for(i in 1:12)
+{
+  hazard0[i]   <- AHP(  1,   5,   1/5,    4,  1/2,
+                      1/5,   1,   1/3,  1/9,    1,
+                        5,   3,     1,    2,    1,
+                      1/4,   9,   1/2,    1,    3,
+                        2,   1,     1,  1/3,    1,
+ iTTCDvector0[i],iDRACvector0[i], iMTTCvector0[i], iCIvector0[i], iDdist0[i])[2]
+
+  decision0[i] <- AHP(  1,   5,   1/5,    4,  1/2,
+                      1/5,   1,   1/3,  1/9,    1,
+                        5,   3,     1,    2,    1,
+                      1/4,   9,   1/2,    1,    3,
+                        2,   1,     1,  1/3,    1,
+iTTCDvector0[i],iDRACvector0[i], iMTTCvector0[i], iCIvector0[i], iDdist0[i])[1]
+ 
+}
+plot(t, hazard0,  type = "b", ylim = c(0,100), pch=5, col = "brown",  main = "hazard percent", xlab = "Time (s)", ylab = "hazard percent")
+
+plot(t, DeltaSLcumullate0.df$y,  ylim = c(0, 1000), type = "b", pch=5, col = "red",  main = "Cumulative spatial displacement", xlab = "Time (s)", ylab = "Cumulative spatial displacement [m]")
+par(new = TRUE)
+lines(t, DeltaSFcumullate0.df$y, ylim = c(0, 1000), pch=18, type = "b", col = "blue",lty=2) 
+#legend(1, 1800, legend=c("Leader", "Following"), col=c("red", "blue"), lty=1:2, cex=1)
+
+####################### Go to LINE 800 and CLICK To Execute ##################
+```
+
+#SOBEPOSIÇÃO DE INDICES
+```{r}
+#library(plotly)
+#require(plotly)
+t <- seq(12)
+indices0.df <- data.frame(t, round(TTCDvector0, 2), round(iDRACvector0, 2), round(MTTCvector0, 2), round(CIvector0, 2), round(DRACvector0, 2))
+indexes0.df <- data.frame(iTTCDvector0,iDRACvector0, iMTTCvector0,iCIvector0)
+#View(indexes.df)
+fig <- ggplot(data=indexes0.df, aes(x=t)) + labs(title = "Sobreposição dos diferentes indexes") + xlab("Tempo [s]") + 
+  ylab("Índice") + xlim(1, 12) + ylim(0, 100) +
+  geom_line(aes(y = iTTCDvector0), color = "darkred", linetype=1, size = 3) + 
+  geom_line(aes(y = iDRACvector0), color="darkgreen", linetype=1, size = 2) +  
+  geom_line(aes(y = iMTTCvector0), color = "blue",    linetype=2, size = 2) +   
+  geom_line(aes(y = iCIvector0),   color="steelblue", linetype=6, size = 2) +
+  scale_color_manual(name="TITLE")+
+  guides(colour = guide_legend(override.aes = list(linetype = 1)))
+ggplotly(fig)
+####################### Go to LINE 820 and CLICK To Execute ###################
+```
+
+#SOBEPOSIÇÃO DE INDICES + HAZARD PERCENTAGE 
+```{r}
+i0.df <- merge(indices0.df,indexes0.df)
+for(l in 1:12){
+  decisao <- merge(hazard0[l],decision0[l])
+}
+for(l in 1:12){
+  decisao[l,] <- merge(hazard0[l],decision0[l])
+}
+ph <- sprintf("%.2f", c(hazard0[1], hazard0[2], hazard0[3], hazard0[4], hazard0[5], hazard0[6], hazard0[7], hazard0[8], hazard0[9], hazard0[10], hazard0[11], hazard0[12]))
+resumo0.df <- data.frame(as.numeric(t), 
+                        as.numeric(sprintf("%.2f", DeltaSLcumullate0.df$y)),
+                        as.numeric(sprintf("%.2f", DeltaSFcumullate0.df$y)),
+                        as.numeric(sprintf("%.2f", iTTCDvector0)),
+                        as.numeric(sprintf("%.2f", iDRACvector0)),
+                        as.numeric(sprintf("%.2f", iMTTCvector0)),
+                        as.numeric(sprintf("%.2f", iCIvector0)),
+                        as.numeric(sprintf("%.2f", iDdist0)),
+                        as.numeric(ph),
+                        decisao[,2])
+names(resumo0.df) <- c("TIME", "DeltaSLcumullate", "DeltaSFcumullate", "TTCD", "DRAC", "MTTC", "CI", "iDdist", "HAZARD", "DECISION")
+View(resumo0.df)
+write.csv2(resumo0.df, "C:\\WYOMING2\\DataFrames\\resultadosCENARIO0_R04.csv")
+
+#library(plotly)
+#require(plotly)
+t <- seq(12)
+fig <- ggplot(data=Vel.df, aes(x=t)) + labs(title = "GRAPHIC OVERLAY") + xlab("TIME [s]") + 
+  ylab("INDEXES VALUES") + xlim(1, 12) + ylim(0, 1000) +
+  geom_line(aes(y = DeltaSLcumullate0.df$y), color = "red",  linetype=5, size = 2) + 
+  geom_line(aes(y = DeltaSFcumullate0.df$y), color = "blue",     linetype=6, size = 2) +  
+  geom_line(aes(y = resumo0.df$TTCD),        color = "darkred",  linetype=1, size = 1) + 
+  geom_line(aes(y = resumo0.df$DRAC),        color = "green",    linetype=2, size = 1) +   
+  geom_line(aes(y = resumo0.df$MTTC),        color = "steelblue",linetype=3, size = 1) +
+  geom_line(aes(y = resumo0.df$CI),          color = "darkgreen",linetype=4, size = 1) +
+  geom_line(aes(y = resumo0.df$HAZARD),      color = "red",      linetype=5, size = 2) +
+  geom_line(aes(y = resumo0.df$iDdist),      color = "orange",   linetype=7, size = 2) +  
+  scale_color_manual(name="VEHICLES VELOCITY")+
+  guides(colour = guide_legend(override.aes = list(linetype = 1)))
+ggplotly(fig)
+
+####################### Go to LINE 865 and CLICK To Execute ###################
+
+```
+
+
+```{r}
+### 01)Plot Cumulative spatial displacement 
+par(mfrow=c(3, 2))
+plot(t, DeltaSLcumullate0.df$y,  ylim = c(0, 1000), type = "b", pch=5, col = "red",  main = "Cumulative spatial displacement", xlab = "Time (s)", ylab = "Cumulative spatial displacement [m]")
+par(new = TRUE)
+lines(t, DeltaSFcumullate0.df$y, ylim = c(0, 1000), pch=18, type = "b", col = "blue",lty=2) 
+#legend(1, 1800, legend=c("Leader", "Following"), col=c("red", "blue"), lty=1:2, cex=1)
+
+### 02)Plot TTC index 
+plot(t, TTCvector0,  type = "b", pch=5, col = "black",  main = "TTC x Time", xlab = "Time [second]", ylab = "TTC index")
+
+### 03)TTCD
+plot(t, TTCDvector0,  type = "b", pch=5, col = "black",  main = "TTCD x Time", xlab = "Time [second]", ylab = "TTCD index")
+
+### 04)MTTC index
+plot(t, MTTCvector0,  type = "o", pch=5, col = "black",  main = "MTTC x Time", xlab = "Time [second]", ylab = "MTTC index")
+
+### 05)Plot DRAC index
+plot(t, DRACvector0,  type = "c", pch=5, col = "purple",  main = "DRAC x Time", xlab = "Time [second]", ylab = "DRAC index")
+
+### 06) CRASH INDEX
+plot(t, CIvector0,  type = "b", pch=5, col = "black",  main = "Crash Index x Time", xlab = "Time [second]", ylab = "Crash Index")
+####################### Go to LINE 890 and CLICK To Execute ###################
+```
+
+```{r}
+par(mfrow=c(3, 2))
+
+### 01)Plot Cumulative spatial displacement 
+plot(t, DeltaSLcumullate0.df$y,  ylim = c(0, 1000), type = "b", pch=5, col = "red",  main = "Cumulative spatial displacement", xlab = "Time (s)", ylab = "Cumulative spatial displacement [m]")
+par(new = TRUE)
+lines(t, DeltaSFcumullate0.df$y, ylim = c(0, 1000), pch=18, type = "b", col = "blue",lty=2) 
+#legend(2, 800, legend=c("Leader", "Following"), col=c("red", "blue"), lty=1:2, cex=1)
+
+### 02)Plot TTC index 
+plot(t, TTCvector0,  type = "b", pch=5, col = "black",  main = "TTC x Time", xlab = "Time [second]", ylab = "TTC index")
+
+### 03)TTCD
+plot(t, iTTCDvector0,  type = "b", pch=5, col = "red",  main = "iTTCD x Time", xlab = "Time [second]", ylab = "TTCD index")
+
+### 04)MTTC index
+plot(t, iMTTCvector0,  type = "o", pch=5, col = "red",  main = "iMTTC x Time", xlab = "Time [second]", ylab = "MTTC index")
+
+### 05)Plot DRAC index
+plot(t, iDRACvector0,  type = "c", pch=5, col = "red",  main = "iDRAC x Time", xlab = "Time [second]", ylab = "DRAC index")
+
+### 06) CRASH INDEX
+plot(t, iCIvector0,  type = "b", pch=5, col = "red",  main = "iCrash Index x Time", xlab = "Time [second]", ylab = "Crash Index")
+
+###############################################################################
+par(mfrow=c(3, 2))
+
+### 07)Plot Cumulative spatial displacement 
+plot(t, DeltaSLcumullate0.df$y,  ylim = c(0, 1000), type = "b", pch=5, col = "red",  main = "Cumulative spatial displacement", xlab = "Time (s)", ylab = "Cumulative spatial displacement [m]")
+par(new = TRUE)
+lines(t, DeltaSFcumullate0.df$y, ylim = c(0, 1000), pch=18, type = "b", col = "blue",lty=2) 
+#legend(2, 800, legend=c("Leader", "Following"), col=c("red", "blue"), lty=1:2, cex=1)
+
+### 08) ACELERATION  data
+plot(t, AccelL0.df$y, ylim = c(-2,2), type = "b", pch=5, col = "red",  main = "Vehicles Accelerations", xlab = "Time (s)", ylab = "Acceleration[m/s-2])")
+par(new = TRUE)
+lines(t, AccelF0.df$y,  type = "b", pch=18, col = "blue",  main = "Following Vehicle Acceleration", xlab = "Time (s)", ylab = "Acceleration[m/s-2])")
+legend(1, 1, legend=c("Leading", "Following"),
+       col=c("red", "blue"), lty=1:2, cex=1)
+
+### 09) Distance Between Vehicles x iDdist Index
+plot(t, Ddist0, ylim = c(-1200, 300), type = "b", pch=5, col = "black",  main = "Distance between vehicles[m]  x T[s]", xlab = "Time (s)", ylab = "Distance between vehicles[m]")
+par(new = TRUE)
+lines(t, iDdist0, pch=18, type = "b", col = "orange",lty=2)
+legend(1, -100, legend=c("Ddist", "iDdist"), col=c("black", "orange"), lty=1:2, cex=1)
+
+### 10) Plot Deceleration Rate
+plot(t, decL0,  type = "b", ylim = c(-10, 10), pch=5, col = "red", main = "Deceleration Rate", xlab = "Time (s)", ylab = "Deceleration Rate")
+par(new = TRUE)
+lines(t, decF0,  pch=18, type = "b", col = "blue",lty=2) 
+legend(8, 9, legend=c("Leading", "Following"),
+       col=c("red", "blue"), lty=1:2, cex=1)
+
+### 11) HAZARD PORCENTAGE
+plot(t, hazard0,  type = "b", ylim = c(0,100), pch=5, col = "brown",  main = "HAZARD PORCENTAGE", xlab = "Time (s)", ylab = "hazard percent")
+
+### 12) Criticality Index Function - CIF (CIF = V^2/TTC)
+plot(t, CIFvector0,  type = "p", pch=5, col = "black",  main = "CIF x Time", xlab = "Time [second]", ylab = "CIF index")
+```
+
